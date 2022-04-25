@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+
+# controlalt v1.3-0
+#
+# released on 2021-06-10
+# tested   on 2021-06-11
+
+# Copyright (C) 2021 Jan Provaznik <provaznik@optics.upol.cz>
+#
+# Permission to use, copy, modify, and/or distribute this software for any
+# purpose with or without fee is hereby granted.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+# REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+# AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+# INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+# LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+# OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+# PERFORMANCE OF THIS SOFTWARE.
+
+# Configuration
+# 
+
+controlServerAddress = '', 49901
+updaterServerAddress = '', 42080
+
+controlServerCapfile = './cap/capfile-%s-%i'
+
+# Implementation, modify at your own peril.
+#
+
+import socketserver
+import http.server
+
+import functools
+import threading
+import pickle
+import time
+import json
+import re
+
+# Synchronized shared state
+#
+
+currentWavelength = 0
+currentWavelengthLock = threading.Lock()
+
+def setCurrentWavelength (val):
+  global currentWavelength
+  global currentWavelengthLock
+
+  with currentWavelengthLock:
+    currentWavelength = val
+
+def getCurrentWavelength (forget = 1):
+  global currentWavelength
+  global currentWavelengthLock
+
+  with currentWavelengthLock:
+    value = currentWavelength
+    if forget:
+      currentWavelength = 0
+
+  return value
+
+# Capture interface
+#
+
+def captureBuffer (address, buffer):
+  if not controlServerCapfile:
+    return
+
+  with open(controlServerCapfile % address, 'ab') as file:
+    payload = (address, buffer)
+    pickle.dump(payload, file)
+
+# Control server interface
+#
+
+def controlServerThread (args = []):
+  server = ControlServer(controlServerAddress, ControlServerHandler)
+  server.serve_forever()
+
+class ControlServer (socketserver.ThreadingTCPServer):
+  allow_reuse_address = 1
+
+class ControlServerHandler (socketserver.BaseRequestHandler):
+  def setup (self):
+    self.clientSock = self.request
+    self.clientAddrRemote = self.client_address
+    self.clientAddrLocal  = self.clientSock.getsockname()
+
+    self.serverSock = self.server.socket
+    self.serverAddr = self.serverSock.getsockname()
+
+  def handle (self):
+    print('Client connected from', self.clientAddrRemote)
+
+    for counter, (reqbuf, reqobj) in enumerate(self.consumeRequest()):
+      try:
+        req = self.processRequest(reqobj)
+        res = self.prepareResponse(req, counter)
+        buf = self.processResponse(res)
+        self.clientSock.send(buf)
+
+      except:
+        raise
+      finally:
+        captureBuffer(self.clientAddrRemote, reqbuf)
+
+  def processRequest (self, val):
+    return ControlRequest(val)
+
+  def processResponse (self, val):
+    return json.dumps(val, separators = (',', ':')).encode('utf-8')
+
+  # In essence the laser connects to the control server (port 49901), initiates
+  # the communication and configures the wavemeter device.
+  #
+  # It then periodically requests the current wavelength and checks whether the
+  # control server is still alive.
+  #
+  # So far we have identified six different requests.
+  #
+  # (1) start-link
+  # (2) configure-wlm
+  # (3) set-measurement-op
+  # (4) wlm-server-app
+  #
+  # (5) check-wlm-server
+  # (6) get-wavelength
+  #
+  # Requests (1-4) seem to be sent by the laser only during the initialization.
+  # 
+  # In essence we replay their (apropriately modified) replies extracted from
+  # the captures we performed on 2021-06-08.
+  #
+  # We do this because we have no idea what the laser wants, especially with
+  # regards to the 'configure-wlm' request.
+
+  def prepareResponse (self, req, counter):
+    requestRouter = {
+      'start-link'          : self.handleRequestStartLink,
+      'set-switch'          : self.handleRequestSetSwitch,
+      'wlm-server-app'      : self.handleRequestWlmServerApp,
+      'configure-wlm'       : self.handleRequestConfigureWlm,
+      'set-measurement-op'  : self.handleRequestSetMeasurementOp,
+      'check-wlm-server'    : self.handleRequestCheckWlmServer,
+      'get-wavelength'      : self.handleRequestGetWavelength
+    }
+
+    print(self.clientAddrRemote, 'prepareResponse: (req %8i) %s' % (counter, req.name))
+
+    if not (req.name in requestRouter):
+      raise ValueError('handler for [%s] not implemented' % req.name)
+
+    handler = requestRouter.get(req.name)
+    responseName, responseParameters = handler(req)
+
+    return {
+      'message' : {
+        'task-count'      : [ 1 ],
+        'transmission-id' : [ counter ],
+        'transmission'    : {
+          'task1'         : {
+            'id'          : [ req.id ],
+            'name'        : responseName,
+            'parameters'  : responseParameters
+          }
+        }
+      }
+    }
+  
+  # Communication protocol is based on JSON encoded data exchange.
+  #
+  # Unfortunately the protocol does not provide indicators of message length;
+  # we must therefore read individual bytes of the stream until we obtain a
+  # valid JSON.
+
+  def consumeRequest (self):
+    buffer = bytes()
+    active = 1
+
+    while active:
+      try:
+        nugget = self.clientSock.recv(1)
+      except socket.ConnectionResetError:
+        nugget = bytes()
+
+      buffer = buffer + nugget
+      active = len(nugget) > 0
+
+      # We consumed the resource stream entirely,
+      # we bail out early if all we have is white space.
+
+      if (not active) and (not buffer.strip()):
+        return
+
+      # Attempt to parse the buffer we collected so far. 
+      #
+      # If parsing succeeds,
+      # we yield the buffer and the parsed JSON object.
+      #
+      # If parsing fails, and the resource is not consumed yet,
+      # we squelch the error and continue consuming the resource. 
+      #
+      # If parsing fails and the resource is already consumed, 
+      # we are dealing with errornous message and therefore we must propagate
+      # the error to the caller.
+
+      try:
+        yield buffer, json.loads(buffer)
+        buffer = bytes()
+      except json.JSONDecodeError as error:
+        if active:
+          continue
+        raise
+
+  # Communication handlers: replay of captured initialization (1-4)
+  #
+
+  def handleRequestStartLink (self, req):
+    value = self.clientAddrLocal[0]
+    return 'start-link-reply', {
+      'status'      : 'ok',
+      'ip-address'  : value
+    }
+
+  def handleRequestWlmServerApp (self, req):
+    return 'wlm-server-app-reply', {
+      'status' : 'ok'
+    }
+
+  def handleRequestSetSwitch (self, req):
+    return 'set-switch-reply', {
+      'status' : 'ok'
+    }
+
+  def handleRequestConfigureWlm (self, req):
+    return 'configure-wlm-reply', {
+      'result-mode'           : 'ok',
+      'exposure-mode'         : 'ok',
+      'pulse-mode'            : 'ok',
+      'precision'             : 'ok',
+      'fast-mode'             : 'ok',
+      'pid-p'                 : 'failed',
+      'pid-i'                 : 'failed',
+      'pid-d'                 : 'failed',
+      'pid-t'                 : 'failed',
+      'pid-dt'                : 'failed',
+      'sensitivity-factor'    : 'failed',
+      'use-ta'                : 'failed',
+      'polarity'              : 'failed',
+      'sensitivity-dimension' : 'failed',
+      'use-const-dt'          : 'failed',
+      'auto-clear-history'    : 'failed',
+      'channel'               : [1]
+    }
+
+  def handleRequestSetMeasurementOp (self, req):
+    return 'set-measurement-op-reply', {
+      'status' : 'ok'
+    }
+
+  # Communication handlers: keep alive ping-pong (5)
+  # 
+
+  def handleRequestCheckWlmServer (self, req):
+    return 'check-wlm-server-reply', {
+      'status' : 'active'
+    }
+  
+  # Communication handlers: wavelength retrieval (6)
+  # 
+
+  def handleRequestGetWavelength (self, req):
+    value = getCurrentWavelength()
+
+    if value > 0:
+      status = 'ok'
+    else:
+      status = 'no-signal'
+
+    return 'get-wavelength-reply', {
+      'status'        : status,
+      'channel'       : [ 1 ],
+      'wavelength'    : [ value ],
+      'calibration'   : 'inactive',
+      'coniguration'  : 'ok',
+      'mode'          : 'fixed'
+    }
+
+class ControlRequest (object):
+  def __init__ (self, val):
+    self.process(val)
+
+  def process (self, val):
+    try:
+      message = val['message']
+      content = message['transmission']['task1']
+
+      requestId   = message['transmission-id'][0]
+      requestName = content['name']
+
+      self._requestId = requestId
+      self._requestName = requestName
+
+    except:
+      raise
+
+  @property
+  def id (self):
+    return self._requestId
+
+  @property
+  def name (self):
+    return self._requestName
+
+
+# Updater server interface
+#
+
+def updaterServerThread (args = []):
+  server = http.server.ThreadingHTTPServer(updaterServerAddress, UpdaterServerHandler)
+  server.serve_forever()
+
+class UpdaterServerHandler (http.server.BaseHTTPRequestHandler):
+
+  def do_GET (self):
+    self.matchRoute(self.path, [
+      (self.handleGet, '/get$')
+    ])
+
+  def do_PUT (self):
+    self.matchRoute(self.path, [
+      (self.handleSet, '/set/([1-9]+[0-9]*|0)$'),
+      (self.handleSet, '/set/([1-9]+[0-9]*\.[0-9]+)$'),
+      (self.handleSet, '/set/(0\.[0-9]+)$'),
+    ])
+
+  # Routing engine, a bit rudimentary approach
+  #
+
+  def matchRoute (self, routePath, requestRoutes):
+    for routeHandler, routePattern in requestRoutes:
+      match = re.match(routePattern, routePath)
+      if not match:
+        continue
+
+      try:
+        routeParams = match.groups()
+        routeHandler(* routeParams)
+      except Exception as error:
+        self.respond(500, str(error))
+      finally:
+        return
+
+    self.respond(404, 'No route matches [%s]' % routePath)
+
+  def respond (self, code, message = ''):
+    self.send_response_only(code)
+    self.send_header('Content-Type', 'text/plain')
+    self.send_header('Content-Encoding', 'utf-8')
+    self.end_headers()
+
+    self.wfile.write(message.encode('utf-8'))
+
+  # Route handlers
+  #
+
+  def handleSet (self, value):
+    try:
+      value = float(value)
+      setCurrentWavelength(value)
+      self.respond(200, 'Seting the value to [%.15f]\n' % value)
+
+      print('updater: set value to %.15f' % value)
+    except ValueError as error:
+      self.respond(500, str(error))
+
+  def handleGet (self):
+    try:
+      value = getCurrentWavelength(forget = 0)
+      self.respond(200, 'Current value is [%.15f]\n' % value)
+    except Exception as error:
+      self.respond(500, str(error))
+
+# We could use some argparse here, 
+# but static configuration must do.
+#
+
+if (__name__ == '__main__'):
+
+  threading.Thread(target = controlServerThread, daemon = 0).start()
+  threading.Thread(target = updaterServerThread, daemon = 0).start()
+
+# vim:et:ts=2:sw=2:syntax=none:colorcolumn=:filetype=off
